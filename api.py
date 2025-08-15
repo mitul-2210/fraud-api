@@ -10,6 +10,7 @@ import boto3
 import joblib
 import numpy as np
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
@@ -62,6 +63,13 @@ def load_artifacts():
 
 model, feature_names = load_artifacts()
 app = FastAPI(title="Credit Card Fraud Detection API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")

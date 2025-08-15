@@ -64,6 +64,25 @@ def load_artifacts():
 
 
 model, feature_names = load_artifacts()
+
+def _generate_high_risk_sample(trained_model, num: int = 4000, seed: int = 42) -> list[float]:
+    rng = np.random.default_rng(seed)
+    # Random candidates covering broad ranges
+    times = rng.integers(0, 300000, size=num).astype(float)
+    v = rng.uniform(-6.0, 6.0, size=(num, 28)).astype(float)
+    # Log-uniform amounts between ~10 and 5000
+    amounts = np.exp(rng.uniform(np.log(10.0), np.log(5000.0), size=num)).astype(float)
+    X = np.column_stack([times, v, amounts])
+    proba_fn = getattr(trained_model, "predict_proba", None)
+    if proba_fn is None:
+        preds = trained_model.predict(X).astype(int)
+        idx = int(np.argmax(preds))
+    else:
+        probs = proba_fn(X)[:, 1]
+        idx = int(np.argmax(probs))
+    return X[idx].tolist()
+
+FRAUD_SAMPLE_FEATURES = _generate_high_risk_sample(model)
 app = FastAPI(title="Credit Card Fraud Detection API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -229,16 +248,8 @@ def score_from_raw(req: RawTxnRequest):
 
 @app.get("/sample_fraud")
 def sample_fraud():
-    # Baked-in fraud-like sample (30 floats: Time, V1..V28, Amount)
-    features = [
-        100000.0,
-        -3.21, 4.50, -4.10, 3.85, -5.30, 5.00, -4.40, 4.20, -5.10,
-        5.15, -4.95, 4.60, -5.25, 5.40, -5.05, 5.10, -4.70, 4.85,
-        -5.00, 5.00, -4.60, 4.90, -5.30, 5.20, -4.80, 4.70, -5.10,
-        5.40,
-        3000.0
-    ]
-    return {"features": features}
+    # Return a model-tailored high-risk feature vector (Time, V1..V28, Amount)
+    return {"features": FRAUD_SAMPLE_FEATURES}
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))

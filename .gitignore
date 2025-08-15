@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv*/
+env/
+venv/
+ENV/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project artifacts
+model.joblib
+feature_names.json
+model.tar.gz
+payload.json
+out.json
+
+# Tools
+.idea/
+.vscode/
+*.code-workspace
+
+

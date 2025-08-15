@@ -1,9 +1,9 @@
 version: 1.0
 runtime: python3
 build:
-  commands:
-    - python -m pip install --upgrade pip setuptools wheel
-    - pip install --no-cache-dir -r requirements.txt
+  commands: |
+    python -m pip install --upgrade pip setuptools wheel
+    pip install --no-cache-dir -r requirements.txt
 run:
   command: uvicorn api:app --host 0.0.0.0 --port 8080
   network:

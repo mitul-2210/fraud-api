@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import os
+import logging
 from typing import List
+import boto3
 
 import joblib
 import numpy as np
@@ -28,10 +30,30 @@ class PredictResponse(BaseModel):
     probability_fraud: float
 
 
+def _maybe_download_from_s3() -> None:
+    bucket = os.getenv("MODEL_S3_BUCKET")
+    prefix = os.getenv("MODEL_S3_PREFIX")
+    if not bucket or not prefix:
+        return
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    s3 = boto3.client("s3")
+    targets = {
+        "model.joblib": MODEL_PATH,
+        "feature_names.json": FEATURE_NAMES_PATH,
+    }
+    for key, dest in targets.items():
+        if not dest.exists():
+            s3_key = f"{prefix.rstrip('/')}/{key}"
+            logging.info(f"Downloading s3://{bucket}/{s3_key} -> {dest}")
+            s3.download_file(bucket, s3_key, str(dest))
+
+
 def load_artifacts():
     if not MODEL_PATH.exists() or not FEATURE_NAMES_PATH.exists():
+        _maybe_download_from_s3()
+    if not MODEL_PATH.exists() or not FEATURE_NAMES_PATH.exists():
         raise RuntimeError(
-            "Model artifacts not found. Train the model by running 'python train_model.py' first."
+            "Model artifacts not found. Provide MODEL_S3_BUCKET/PREFIX or run 'python train_model.py'."
         )
     model = joblib.load(MODEL_PATH)
     feature_names: List[str] = json.loads(FEATURE_NAMES_PATH.read_text())

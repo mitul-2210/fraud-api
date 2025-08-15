@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 import os
 import logging
-from typing import List
+from typing import List, Optional
+import hashlib
+from datetime import datetime
 import boto3
 
 import joblib
@@ -138,6 +140,105 @@ def invocations(raw_body: bytes = None, content_type: str | None = None):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+class RawTxnRequest(BaseModel):
+    amount: float
+    timestamp: Optional[float] = None
+    card_brand: Optional[str] = None
+    card_bin: Optional[str] = None
+    last4: Optional[str] = None
+    merchant_id: Optional[str] = None
+    country: Optional[str] = None
+    channel: Optional[str] = None
+    device_os: Optional[str] = None
+    device_browser: Optional[str] = None
+
+
+def _hash_to_float(s: str, salt: str, scale: float = 2.0) -> float:
+    h = hashlib.md5((salt + "::" + (s or "")).encode("utf-8")).hexdigest()
+    val = int(h[:8], 16) / 0xFFFFFFFF
+    return (val * 2.0 - 1.0) * scale
+
+
+def _engineer_demo_features(raw: RawTxnRequest) -> np.ndarray:
+    ts = raw.timestamp if raw.timestamp is not None else datetime.utcnow().timestamp()
+    time_feat = float(int(ts) % 300000)
+
+    v = [0.0] * 28
+    fields = {
+        "brand": (raw.card_brand or "unknown").lower(),
+        "bin": raw.card_bin or "",
+        "last4": raw.last4 or "",
+        "merchant": raw.merchant_id or "",
+        "country": (raw.country or "").upper(),
+        "channel": (raw.channel or "ecom").lower(),
+        "os": (raw.device_os or "").lower(),
+        "browser": (raw.device_browser or "").lower(),
+    }
+    salts = [
+        "brand", "bin", "last4", "merchant", "country", "channel", "os", "browser",
+        "brand+merchant", "country+merchant", "bin+country", "os+browser",
+        "brand+country", "channel+merchant", "bin+os", "browser+merchant",
+    ]
+    combos = [
+        fields["brand"], fields["bin"], fields["last4"], fields["merchant"],
+        fields["country"], fields["channel"], fields["os"], fields["browser"],
+        fields["brand"] + ":" + fields["merchant"],
+        fields["country"] + ":" + fields["merchant"],
+        fields["bin"] + ":" + fields["country"],
+        fields["os"] + ":" + fields["browser"],
+        fields["brand"] + ":" + fields["country"],
+        fields["channel"] + ":" + fields["merchant"],
+        fields["bin"] + ":" + fields["os"],
+        fields["browser"] + ":" + fields["merchant"],
+    ]
+    for i in range(min(16, len(v))):
+        v[i] = _hash_to_float(combos[i], salts[i])
+
+    amt = float(raw.amount)
+    v[16] = np.log1p(max(amt, 0.0))
+    v[17] = (amt % 1000) / 1000.0 * 2 - 1
+    v[18] = _hash_to_float(fields["merchant"], "amt-bucket-" + str(int(amt // 50)))
+    v[19] = _hash_to_float(fields["country"], "amt-sign-" + ("H" if amt > 500 else "L"))
+    v[20] = _hash_to_float(fields["channel"], "ch")
+    v[21] = _hash_to_float(fields["brand"], "br")
+    v[22] = _hash_to_float(fields["bin"], "bn")
+    v[23] = _hash_to_float(fields["last4"], "l4")
+    v[24] = _hash_to_float(fields["os"], "os")
+    v[25] = _hash_to_float(fields["browser"], "bw")
+    v[26] = _hash_to_float(fields["merchant"], "mx")
+    v[27] = _hash_to_float(fields["country"], "cx")
+
+    features = [time_feat] + v + [amt]
+    return np.array(features, dtype=float).reshape(1, -1)
+
+
+@app.post("/score", response_model=PredictResponse)
+def score_from_raw(req: RawTxnRequest):
+    try:
+        x = _engineer_demo_features(req)
+        proba = getattr(model, "predict_proba", None)
+        if proba is None:
+            pred_label = int(model.predict(x)[0])
+            return PredictResponse(is_fraud=bool(pred_label), probability_fraud=float(pred_label))
+        prob = float(proba(x)[0][1])
+        pred_label = prob >= 0.5
+        return PredictResponse(is_fraud=bool(pred_label), probability_fraud=prob)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/sample_fraud")
+def sample_fraud():
+    # Baked-in fraud-like sample (30 floats: Time, V1..V28, Amount)
+    features = [
+        100000.0,
+        -3.21, 4.50, -4.10, 3.85, -5.30, 5.00, -4.40, 4.20, -5.10,
+        5.15, -4.95, 4.60, -5.25, 5.40, -5.05, 5.10, -4.70, 4.85,
+        -5.00, 5.00, -4.60, 4.90, -5.30, 5.20, -4.80, 4.70, -5.10,
+        5.40,
+        3000.0
+    ]
+    return {"features": features}
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))

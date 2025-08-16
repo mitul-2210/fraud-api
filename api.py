@@ -7,7 +7,9 @@ import logging
 from typing import List, Optional
 import hashlib
 from datetime import datetime
+import random
 import boto3
+import pandas as pd
 
 import joblib
 import numpy as np
@@ -21,6 +23,12 @@ APP_DIR = Path(__file__).resolve().parent
 MODEL_DIR = Path(os.getenv("SM_MODEL_DIR", str(APP_DIR)))
 MODEL_PATH = MODEL_DIR / "model.joblib"
 FEATURE_NAMES_PATH = MODEL_DIR / "feature_names.json"
+FEATURE_PIPELINE_PATH = MODEL_DIR / "feature_pipeline.joblib"
+RAW_PIPELINE_PATH = MODEL_DIR / "raw_pipeline.joblib"
+RAW_SCHEMA_PATH = MODEL_DIR / "raw_schema.json"
+
+# Configurable prediction threshold and CORS origins
+THRESHOLD: float = float(os.getenv("FRAUD_THRESHOLD", "0.5"))
 
 
 class PredictRequest(BaseModel):
@@ -43,6 +51,8 @@ def _maybe_download_from_s3() -> None:
     targets = {
         "model.joblib": MODEL_PATH,
         "feature_names.json": FEATURE_NAMES_PATH,
+        "raw_pipeline.joblib": RAW_PIPELINE_PATH,
+        "raw_schema.json": RAW_SCHEMA_PATH,
     }
     for key, dest in targets.items():
         if not dest.exists():
@@ -60,10 +70,20 @@ def load_artifacts():
         )
     model = joblib.load(MODEL_PATH)
     feature_names: List[str] = json.loads(FEATURE_NAMES_PATH.read_text())
-    return model, feature_names
+    feature_pipeline = None
+    raw_pipeline = None
+    try:
+        if FEATURE_PIPELINE_PATH.exists():
+            feature_pipeline = joblib.load(FEATURE_PIPELINE_PATH)
+        if RAW_PIPELINE_PATH.exists():
+            raw_pipeline = joblib.load(RAW_PIPELINE_PATH)
+    except Exception:
+        feature_pipeline = feature_pipeline or None
+        raw_pipeline = raw_pipeline or None
+    return model, feature_names, feature_pipeline, raw_pipeline
 
 
-model, feature_names = load_artifacts()
+model, feature_names, feature_pipeline, raw_pipeline = load_artifacts()
 
 def _generate_high_risk_sample(trained_model, num: int = 4000, seed: int = 42) -> list[float]:
     rng = np.random.default_rng(seed)
@@ -82,11 +102,17 @@ def _generate_high_risk_sample(trained_model, num: int = 4000, seed: int = 42) -
         idx = int(np.argmax(probs))
     return X[idx].tolist()
 
-FRAUD_SAMPLE_FEATURES = _generate_high_risk_sample(model)
+FRAUD_SAMPLES_PATH = APP_DIR / "fraud_samples.json"
+try:
+    FRAUD_SAMPLES = json.loads(FRAUD_SAMPLES_PATH.read_text()) if FRAUD_SAMPLES_PATH.exists() else None
+except Exception:
+    FRAUD_SAMPLES = None
 app = FastAPI(title="Credit Card Fraud Detection API", version="1.0.0")
+cors_origins = os.getenv("CORS_ORIGINS", "*")
+allowed_origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -108,7 +134,7 @@ def predict(req: PredictRequest):
             pred_label = int(model.predict(x)[0])
             return PredictResponse(is_fraud=bool(pred_label), probability_fraud=float(pred_label))
         prob = float(proba(x)[0][1])
-        pred_label = prob >= 0.5
+        pred_label = prob >= THRESHOLD
         return PredictResponse(is_fraud=bool(pred_label), probability_fraud=prob)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -150,13 +176,27 @@ def invocations(raw_body: bytes = None, content_type: str | None = None):
             probs = preds
         else:
             probs = proba(arr)[:, 1].tolist()
-            preds = [int(p >= 0.5) for p in probs]
+            preds = [int(p >= THRESHOLD) for p in probs]
         return {
             "predictions": preds,
             "probabilities": probs,
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/metadata")
+def metadata():
+    return {
+        "model_path": str(MODEL_PATH),
+        "feature_names_path": str(FEATURE_NAMES_PATH),
+        "feature_pipeline_present": FEATURE_PIPELINE_PATH.exists(),
+        "raw_pipeline_present": RAW_PIPELINE_PATH.exists(),
+        "raw_schema_present": RAW_SCHEMA_PATH.exists(),
+        "threshold": THRESHOLD,
+        "cors_origins": [o for o in (os.getenv("CORS_ORIGINS", "*").split(",")) if o],
+        "version": "1.0.0",
+    }
 
 
 class RawTxnRequest(BaseModel):
@@ -234,13 +274,36 @@ def _engineer_demo_features(raw: RawTxnRequest) -> np.ndarray:
 @app.post("/score", response_model=PredictResponse)
 def score_from_raw(req: RawTxnRequest):
     try:
+        # Preferred path: trained raw pipeline (production-like)
+        if raw_pipeline is not None:
+            payload = {
+                "amount": float(req.amount),
+                "time_minute": float((req.timestamp or datetime.utcnow().timestamp()) % 3600) / 60.0,
+                "country": (req.country or "").upper(),
+                "channel": (req.channel or "ecom").lower(),
+                "merchant_id": req.merchant_id or "m_demo",
+                "card_brand": (req.card_brand or "unknown").lower(),
+                "card_bin": req.card_bin or "",
+                "last4": req.last4 or "",
+                "device_os": (req.device_os or "").lower(),
+                "device_browser": (req.device_browser or "").lower(),
+            }
+            df = pd.DataFrame([payload])
+            proba = getattr(raw_pipeline, "predict_proba", None)
+            if proba is None:
+                pred_label = int(raw_pipeline.predict(df)[0])
+                return PredictResponse(is_fraud=bool(pred_label), probability_fraud=float(pred_label))
+            prob = float(proba(df)[0][1])
+            pred_label = prob >= THRESHOLD
+            return PredictResponse(is_fraud=bool(pred_label), probability_fraud=prob)
+        # Fallback: demo transformer to 30 features + model
         x = _engineer_demo_features(req)
         proba = getattr(model, "predict_proba", None)
         if proba is None:
             pred_label = int(model.predict(x)[0])
             return PredictResponse(is_fraud=bool(pred_label), probability_fraud=float(pred_label))
         prob = float(proba(x)[0][1])
-        pred_label = prob >= 0.5
+        pred_label = prob >= THRESHOLD
         return PredictResponse(is_fraud=bool(pred_label), probability_fraud=prob)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -248,8 +311,12 @@ def score_from_raw(req: RawTxnRequest):
 
 @app.get("/sample_fraud")
 def sample_fraud():
-    # Return a model-tailored high-risk feature vector (Time, V1..V28, Amount)
-    return {"features": FRAUD_SAMPLE_FEATURES}
+    # Return a random fraud-like vector. Prefer curated samples file if present; else generate.
+    if FRAUD_SAMPLES and isinstance(FRAUD_SAMPLES, list):
+        return {"features": random.choice(FRAUD_SAMPLES)}
+    # Fallback: generate a high-risk sample on the fly with a random seed
+    features = _generate_high_risk_sample(model, num=5000, seed=random.randint(1, 10_000_000))
+    return {"features": features}
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
